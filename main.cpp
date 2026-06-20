@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
@@ -9,19 +11,32 @@
 // CONFIG
 // ============================================================
 
-#define BUZZER_PIN 3
-#define USE_BUZZER 1
+#if defined(ARDUINO_XIAO_ESP32C5)
+  #define BUZZER_PIN       D0   // unused — no piezo on this build
+  #define USE_BUZZER       0
+  #define LED_PIN          LED_BUILTIN
+  #define USE_LED          1
+  #define LED_ACTIVE_HIGH  0    // assumed active-low, matching XIAO S3 convention — confirm on first boot
+  #define LED_FLASH_MS     120
 
-// Onboard user LED on Seeed XIAO ESP32-S3 is GPIO21 and is ACTIVE LOW
-// (driving the pin LOW lights the LED).
-#define LED_PIN          21
-#define USE_LED          1
-#define LED_ACTIVE_HIGH  0
-#define LED_FLASH_MS     120
+  #define MIRROR_SERIAL    0    // disabled: no verified-free GPIO for UART mirror on C5 yet
+  #define MIRROR_TX_PIN    -1
+  #define MIRROR_BAUD      115200
+#else
+  #define BUZZER_PIN 3
+  #define USE_BUZZER 1
 
-#define MIRROR_SERIAL    1
-#define MIRROR_TX_PIN    43
-#define MIRROR_BAUD      115200
+  // Onboard user LED on Seeed XIAO ESP32-S3 is GPIO21 and is ACTIVE LOW
+  // (driving the pin LOW lights the LED).
+  #define LED_PIN          21
+  #define USE_LED          1
+  #define LED_ACTIVE_HIGH  0
+  #define LED_FLASH_MS     120
+
+  #define MIRROR_SERIAL    1
+  #define MIRROR_TX_PIN    43
+  #define MIRROR_BAUD      115200
+#endif
 
 #define CHANNEL_MODE_FULL_HOP   0
 #define CHANNEL_MODE_CUSTOM     1
@@ -31,7 +46,22 @@
 #define CHANNEL_DWELL_MS 350
 #define SINGLE_CHANNEL 1
 
+#if defined(ARDUINO_XIAO_ESP32C5)
+// Mostly 2.4GHz (preserves drive-by revisit cadence), one 5GHz channel
+// woven in per group so the full 5GHz set sweeps once every ~11.2s.
+static const uint8_t customChannels[] = {
+  1, 6, 11, 36,
+  1, 6, 11, 40,
+  1, 6, 11, 44,
+  1, 6, 11, 48,
+  1, 6, 11, 149,
+  1, 6, 11, 153,
+  1, 6, 11, 157,
+  1, 6, 11, 161
+};
+#else
 static const uint8_t customChannels[]  = {1, 6, 11};
+#endif
 static const size_t  customChannelCount = sizeof(customChannels) / sizeof(customChannels[0]);
 
 static const uint8_t fullHopChannels[] = {1,2,3,4,5,6,7,8,9,10,11};
@@ -92,7 +122,6 @@ static const char* target_ouis[] = {
   // + OUI signature during field testing. The 12th camera in his drive-test
   // used this prefix and wasn't in @NitekryDPaul's original 30.
   "82:6b:f2"
-
 };
 static const size_t OUI_COUNT = sizeof(target_ouis) / sizeof(target_ouis[0]);
 
@@ -380,7 +409,9 @@ static const char* channelModeName() {
 }
 
 static inline uint16_t channelFreqMhz(uint8_t ch) {
-  return (ch >= 1 && ch <= 14) ? (uint16_t)(2407 + 5 * ch) : 0;
+  if (ch >= 1 && ch <= 14) return (uint16_t)(2407 + 5 * ch);
+  if (ch >= 36 && ch <= 165) return (uint16_t)(5000 + 5 * ch);
+  return 0;
 }
 
 static bool shouldSuppressDuplicate(const char* macStr) {
@@ -769,11 +800,12 @@ static void emitDetectionJSON(const char* mac, const char* method,
   sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
+  const char* band = (ch >= 1 && ch <= 14) ? "2_4ghz" : "5ghz";
 
   dualPrintf(
       "{\"event\":\"detection\","
       "\"detection_method\":\"wifi_%s\","
-      "\"protocol\":\"wifi_2_4ghz\","
+      "\"protocol\":\"wifi_%s\","
       "\"mac_address\":\"%s\","
       "\"oui\":\"%s\","
       "\"device_name\":\"\","
@@ -781,7 +813,7 @@ static void emitDetectionJSON(const char* mac, const char* method,
       "\"channel\":%u,"
       "\"frequency\":%u,"
       "\"ssid\":\"%s\"}\n",
-      method, mac, oui, rssi,
+      method, band, mac, oui, rssi,
       (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
 }
 
@@ -1080,12 +1112,22 @@ void setup() {
     dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
   }
 
+  esp_netif_init();
+  esp_err_t evLoopErr = esp_event_loop_create_default();
+  if (evLoopErr != ESP_OK && evLoopErr != ESP_ERR_INVALID_STATE) {
+    dualPrintln("[flockyou] esp_event_loop_create_default FAILED");
+  }
+
   WiFi.mode(WIFI_MODE_NULL);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   esp_wifi_set_mode(WIFI_MODE_NULL);
   esp_wifi_start();
+
+#if defined(ARDUINO_XIAO_ESP32C5)
+  esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+#endif
 
   applyInitialChannel();
 
