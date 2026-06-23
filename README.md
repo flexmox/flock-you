@@ -168,7 +168,9 @@ The firmware emits one JSON line per detection in the same schema the BLE detect
 
 ### GPS wardriving
 
-GPS is handled Flask-side, since the ESP32 radio is dedicated to sniffing and there's no on-device AP. Two options:
+On the XIAO ESP32-S3 build, a REYAX RYS352A GNSS module on `Serial2` tags each detection on-device — the JSON line's `gps` field carries `{"latitude","longitude","accuracy"}` once the module has a fix, or `null` before that.
+
+If you'd rather not wire up a GPS module, two Flask-side fallbacks still work:
 
 - **USB NMEA puck** plugged into the host running Flask — Flask reads NMEA and timestamps a GPS timeline
 - **Flask dashboard open in a phone browser** — browser Geolocation API posts updates to Flask
@@ -193,11 +195,12 @@ Open `http://localhost:5000`, pick your serial port from the UI, detections star
 
 | Pin | Function |
 |-----|----------|
-| GPIO 3 | Piezo buzzer |
+| GPIO 3 | Vibration motor driver module (VCC→3V3, GND→GND, Signal→GPIO3) |
 | GPIO 21 | Onboard user LED (active low) |
 | GPIO 43 | Serial1 TX mirror (115200 baud) |
+| GPIO 44 | RYS352A GPS module TXD (115200 baud NMEA, RX-only) |
 
-Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
+Boot pattern: 3 distinct pulses (150ms on / 200ms gap) once SPIFFS + the WiFi sniffer are confirmed up, signaling "ready to scan" rather than just "code reached setup()". One long ~800ms pulse instead means SPIFFS or WiFi init failed.
 
 ---
 

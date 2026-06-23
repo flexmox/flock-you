@@ -12,8 +12,17 @@
 // ============================================================
 
 #if defined(ARDUINO_XIAO_ESP32C5)
-  #define BUZZER_PIN       D0   // unused — no piezo on this build
-  #define USE_BUZZER       0
+  #define MOTOR_PIN        D0   // unused — no haptic motor on this build
+  #define USE_MOTOR        0
+  #define MOTOR_PWM_CHANNEL   0
+  #define MOTOR_PWM_FREQ_HZ   20000
+  #define MOTOR_PWM_RES_BITS  8
+
+  #define USE_GPS          0    // no GPS module on this build
+  #define GPS_RX_PIN       -1
+  #define GPS_TX_PIN       -1
+  #define GPS_BAUD         115200
+
   #define LED_PIN          LED_BUILTIN
   #define USE_LED          1
   #define LED_ACTIVE_HIGH  0    // assumed active-low, matching XIAO S3 convention — confirm on first boot
@@ -23,8 +32,21 @@
   #define MIRROR_TX_PIN    -1
   #define MIRROR_BAUD      115200
 #else
-  #define BUZZER_PIN 3
-  #define USE_BUZZER 1
+  // Vibration-motor driver module (coin motor + transistor on a 3-pin
+  // VCC/GND/Signal breakout) on the same wire the piezo buzzer used to sit on.
+  #define MOTOR_PIN           3
+  #define USE_MOTOR           1
+  #define MOTOR_PWM_CHANNEL   0
+  #define MOTOR_PWM_FREQ_HZ   20000   // above audible range, smooth ERM drive
+  #define MOTOR_PWM_RES_BITS  8       // duty 0-255
+
+  // RYS352A GNSS module: TXD -> GPIO44 (board "RX"/D7). We never send
+  // commands to the module, so TX is left unused (GPIO43 stays free for
+  // the Serial1 debug mirror below).
+  #define USE_GPS          1
+  #define GPS_RX_PIN       44
+  #define GPS_TX_PIN       -1
+  #define GPS_BAUD         115200
 
   // Onboard user LED on Seeed XIAO ESP32-S3 is GPIO21 and is ACTIVE LOW
   // (driving the pin LOW lights the LED).
@@ -71,23 +93,63 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define RSSI_MIN        -95
 #define ALERT_COOLDOWN_MS 5000
 
-// Audio cadence: two fast ascending beeps on a NEW MAC, then while any
-// target is still in range (seen within HB_DEVICE_ACTIVE_MS), two monotone
-// heartbeat beeps every HB_BEEP_INTERVAL_MS.
+// Haptic cadence: two short vibration pulses on a NEW MAC, then while any
+// target is still in range (seen within HB_DEVICE_ACTIVE_MS), two heartbeat
+// pulses every HB_BEEP_INTERVAL_MS.
 #define HB_DEVICE_ACTIVE_MS    3000
 #define HB_BEEP_INTERVAL_MS    10000
 // A MAC we haven't heard from in REDISCOVER_MS counts as a fresh discovery
-// next time it shows up — fires the ascending chirp again. Shorter than a
-// Flock's burst-sleep gap would mean false chirps; longer means you'd miss
+// next time it shows up — fires the double-pulse again. Shorter than a
+// Flock's burst-sleep gap would mean false pulses; longer means you'd miss
 // a drive-away/return. 30 s is a good middle ground.
 #define REDISCOVER_MS          30000
-#define NEW_CHIRP_LO_HZ        2000
-#define NEW_CHIRP_HI_HZ        2800
-#define NEW_CHIRP_NOTE_MS      55
-#define NEW_CHIRP_GAP_MS       25
-#define HB_BEEP_HZ             1500
-#define HB_BEEP_NOTE_MS        70
-#define HB_BEEP_GAP_MS         70
+// An ERM motor coasts for tens of ms after power-off, so pulses need real
+// on-time to spin up and a real gap to fully stop, or they blur into one
+// continuous buzz. These are tuned for "feel," not the old piezo timings.
+#define NEW_CHIRP_NOTE_MS      120
+#define NEW_CHIRP_GAP_MS       150
+#define HB_BEEP_NOTE_MS        150
+#define HB_BEEP_GAP_MS         220
+
+// ============================================================
+// HUNT MODE  — handheld RSSI proximity hunting ("fox hunt")
+// ============================================================
+//
+// Press the BOOT button to LOCK onto the strongest Flock device seen in the
+// last few seconds. While locked we (a) pin to that device's channel and stop
+// hopping, and (b) drive the vibration motor like a Geiger counter: pulses
+// get faster AND stronger as the smoothed RSSI rises. Sweep the unit (or a
+// directional antenna) and walk toward the peak. Press again to release.
+//
+// Two RF realities this handles:
+//   * Channel hopping is suspended so the target is heard continuously, not
+//     ~1/3 of the time.
+//   * Flock devices burst-then-sleep, so the displayed RSSI peak-holds and
+//     decays between bursts — the pulse strength glides down instead of
+//     cutting out.
+//
+// Motor-only build (S3). The C5 has no haptic motor, so hunt is compiled out there.
+#if USE_MOTOR
+  #define HUNT_MODE_ENABLED 1
+#else
+  #define HUNT_MODE_ENABLED 0
+#endif
+
+#define HUNT_BUTTON_PIN        0       // XIAO BOOT button, active-low
+#define HUNT_BTN_DEBOUNCE_MS   40
+#define HUNT_LOCK_RECENT_MS    6000    // lock candidate must be seen this recently
+#define HUNT_REACQUIRE_MS      9000    // locked target silent longer than this → release
+
+// RSSI → feedback mapping (clamped). FAR = weak/distant, NEAR = strong/close.
+#define HUNT_RSSI_FAR          -90
+#define HUNT_RSSI_NEAR         -40
+#define HUNT_INT_FAR_MS        750     // click spacing when weak
+#define HUNT_INT_NEAR_MS       55      // click spacing when strong (near-solid buzz)
+#define HUNT_DUTY_FAR          120     // pulse intensity when weak
+#define HUNT_DUTY_NEAR         255     // pulse intensity when strong
+#define HUNT_CLICK_MS          70      // long enough for the motor to actually spin up
+#define HUNT_DECAY_DB_PER_S    18.0f   // how fast the held RSSI sags between bursts
+#define HUNT_ATTACK            0.6f    // EMA weight toward a fresh (lower) sample
 
 #define ENABLE_SSID_MATCH 0
 #define CHECK_ADDR1 1   // dst/rx — catches Flock STAs receiving probe responses
@@ -242,6 +304,16 @@ static volatile unsigned long ledOffAt = 0;
 static unsigned long fyLastTargetSeen  = 0;
 static unsigned long fyLastHeartbeatAt = 0;
 
+// Hunt mode: locked target + smoothed RSSI used to drive the Geiger audio.
+static bool          huntMode        = false;
+static uint8_t       huntMacBytes[6] = {0};
+static char          huntMacStr[18]  = {0};
+static uint8_t       huntChannel     = 0;
+static float         huntDisplayRssi = -100.0f;  // peak-held, decaying RSSI
+static unsigned long huntLastPktMs   = 0;        // last packet from the locked MAC
+static unsigned long huntLastClickAt = 0;
+static unsigned long huntLastDecayAt = 0;
+
 // ============================================================
 // 802.11 HEADER
 // ============================================================
@@ -310,40 +382,180 @@ static void ledTick() {
 #endif
 }
 
-static void buzzerBeep(unsigned int ms) {
-#if USE_BUZZER
-  digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
+// Non-blocking pulse, same pattern as ledFlash/ledTick above: set a duty,
+// remember when to cut it, and let motorTick() turn it off on time. This is
+// what lets huntAudioTick() fire pulses without blocking the scan loop, the
+// same way tone(pin, hz, ms) used to for the piezo.
+static uint32_t motorOffAt = 0;
+
+static inline void motorSet(uint8_t duty) {
+#if USE_MOTOR
+  ledcWrite(MOTOR_PWM_CHANNEL, duty);
 #endif
 }
 
-// Two fast ascending beeps — played on the FIRST sighting of a MAC.
+static void motorPulse(unsigned ms, uint8_t duty = 255) {
+#if USE_MOTOR
+  motorSet(duty);
+  motorOffAt = millis() + ms;
+  if (motorOffAt == 0) motorOffAt = 1;  // avoid the "off" sentinel
+#endif
+}
+
+static void motorTick() {
+#if USE_MOTOR
+  if (motorOffAt && (long)(millis() - motorOffAt) >= 0) {
+    motorSet(0);
+    motorOffAt = 0;
+  }
+#endif
+}
+
+static void motorBeep(unsigned int ms) {
+#if USE_MOTOR
+  motorPulse(ms);
+  delay(ms);
+  motorSet(0);
+  motorOffAt = 0;
+#endif
+}
+
+// Two short pulses — played on the FIRST sighting of a MAC. The old piezo
+// used two rising tones here; a motor can't convey pitch, so the "new MAC"
+// signature is now a quick double-buzz instead.
 static void newDetectChirp() {
-#if USE_BUZZER
-  tone(BUZZER_PIN, NEW_CHIRP_LO_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
+#if USE_MOTOR
+  motorSet(255); delay(NEW_CHIRP_NOTE_MS); motorSet(0);
   delay(NEW_CHIRP_GAP_MS);
-  tone(BUZZER_PIN, NEW_CHIRP_HI_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
+  motorSet(255); delay(NEW_CHIRP_NOTE_MS); motorSet(0);
 #endif
 }
 
-// Two monotone beeps — periodic heartbeat while at least one target is still
-// in range (last seen within HB_DEVICE_ACTIVE_MS).
+// Two equal pulses — periodic heartbeat while at least one target is still
+// in range (last seen within HB_DEVICE_ACTIVE_MS). Different note/gap timing
+// than newDetectChirp keeps the two cues distinguishable by feel.
 static void heartbeatBeep() {
-#if USE_BUZZER
-  tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
+#if USE_MOTOR
+  motorSet(255); delay(HB_BEEP_NOTE_MS); motorSet(0);
   delay(HB_BEEP_GAP_MS);
-  tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
+  motorSet(255); delay(HB_BEEP_NOTE_MS); motorSet(0);
 #endif
 }
+// "Ready to scan" signal — called at the end of setup() once SPIFFS and the
+// WiFi promiscuous sniffer have actually come up, so feeling this means the
+// device is live, not just that code reached this line.
 static void startupBeep() {
-#if USE_BUZZER
-  // First 6 notes of SMB World 1-2 (underground). Koji Kondo's descending
-  // pattern: C5 → C4 → A4 → A3 → G#4 → G#3 (alternating-octave pairs).
-  static const uint16_t notes[6] = { 523, 262, 440, 220, 415, 208 };
-  for (int i = 0; i < 6; i++) {
-    tone(BUZZER_PIN, notes[i]);
-    delay((i == 5) ? 160 : 95);
-    noTone(BUZZER_PIN);
-    if (i < 5) delay(22);
+#if USE_MOTOR
+  // 3 distinct pulses, well separated so each one is felt as its own buzz
+  // instead of blurring into one continuous vibration (see NEW_CHIRP_GAP_MS
+  // comment above on ERM motor coast-down).
+  for (int i = 0; i < 3; i++) {
+    motorSet(255);
+    delay(150);
+    motorSet(0);
+    if (i < 2) delay(200);
+  }
+#endif
+}
+
+// One long pulse — distinct from the success rhythm above — if SPIFFS or the
+// WiFi sniffer failed to come up during setup().
+static void bootFailBeep() {
+#if USE_MOTOR
+  motorSet(255);
+  delay(800);
+  motorSet(0);
+#endif
+}
+
+// ============================================================
+// GPS (RYS352A, NMEA 0183 over UART) — Serial2, RX-only on GPS_RX_PIN.
+// Hand-rolled GGA parser — no GPS library, matching the project's
+// zero-extra-dependency stance (see README "Build and flash").
+// ============================================================
+
+static double        gpsLat       = 0.0;
+static double        gpsLon       = 0.0;
+static float         gpsHdop      = 99.9f;
+static bool          gpsFixValid  = false;
+static unsigned long  gpsLastFixAt = 0;
+
+static char   gpsLineBuf[96];
+static size_t gpsLineLen = 0;
+
+// sentence points at '$'; validates the trailing "*XX" checksum.
+static bool gpsChecksumOk(const char* sentence) {
+  const char* star = strchr(sentence, '*');
+  if (!star || strlen(star) < 3) return false;
+  uint8_t sum = 0;
+  for (const char* p = sentence + 1; p < star; p++) sum ^= (uint8_t)*p;
+  uint8_t want = (uint8_t)strtol(star + 1, nullptr, 16);
+  return sum == want;
+}
+
+// NMEA "(d)ddmm.mmmm" + hemisphere char -> signed decimal degrees. Works for
+// both 2-digit (lat) and 3-digit (lon) degree prefixes — the minutes portion
+// is always < 100, so truncating raw/100 isolates the degrees either way.
+static double gpsToDecimalDegrees(const char* field, char hemi) {
+  if (!field || !*field) return 0.0;
+  double raw = atof(field);
+  long   degPart = (long)(raw / 100.0);
+  double minPart = raw - (degPart * 100.0);
+  double dd = degPart + minPart / 60.0;
+  if (hemi == 'S' || hemi == 'W') dd = -dd;
+  return dd;
+}
+
+// line is NUL-terminated, starts with '$', no trailing CR/LF.
+static void gpsHandleSentence(char* line) {
+  if (line[0] != '$') return;
+  if (!gpsChecksumOk(line)) return;
+
+  const char* star = strchr(line, '*');
+  size_t bodyLen = star ? (size_t)(star - line) : strlen(line);
+  // Match sentence type by suffix so any talker ID (GP/GN/GL/GA/GB) works.
+  if (bodyLen < 6 || strncmp(line + bodyLen - 3, "GGA", 3) != 0) return;
+
+  char body[96];
+  size_t copyLen = (bodyLen < sizeof(body) - 1) ? bodyLen : sizeof(body) - 1;
+  memcpy(body, line, copyLen);
+  body[copyLen] = '\0';
+
+  // $..GGA,time,lat,N/S,lon,E/W,quality,numSats,hdop,alt,...
+  char* fields[15] = {0};
+  int n = 0;
+  char* tok = strtok(body, ",");
+  while (tok && n < 15) { fields[n++] = tok; tok = strtok(nullptr, ","); }
+  if (n < 9) return;
+
+  int quality = atoi(fields[6]);
+  if (quality <= 0) { gpsFixValid = false; return; }
+
+  gpsLat       = gpsToDecimalDegrees(fields[2], fields[3][0]);
+  gpsLon       = gpsToDecimalDegrees(fields[4], fields[5][0]);
+  gpsHdop      = atof(fields[8]);
+  gpsFixValid  = true;
+  gpsLastFixAt = millis();
+}
+
+static void gpsInit() {
+#if USE_GPS
+  Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+#endif
+}
+
+static void gpsTick() {
+#if USE_GPS
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\n') {
+      gpsLineBuf[gpsLineLen] = '\0';
+      if (gpsLineLen > 0) gpsHandleSentence(gpsLineBuf);
+      gpsLineLen = 0;
+    } else if (c != '\r') {
+      if (gpsLineLen < sizeof(gpsLineBuf) - 1) gpsLineBuf[gpsLineLen++] = c;
+      else gpsLineLen = 0;  // overflow — drop the malformed line
+    }
   }
 #endif
 }
@@ -451,6 +663,16 @@ static void applyInitialChannel() {
 
 static void updateChannelMode() {
   if (sniffingStopped) return;
+#if HUNT_MODE_ENABLED
+  // Locked onto a target: hold its channel, suspend hopping entirely.
+  if (huntMode) {
+    if (currentChannel != huntChannel) {
+      currentChannel = huntChannel;
+      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    }
+    return;
+  }
+#endif
 #if CHANNEL_MODE == CHANNEL_MODE_SINGLE
   if (currentChannel != SINGLE_CHANNEL) {
     currentChannel = SINGLE_CHANNEL;
@@ -788,8 +1010,18 @@ static void fyPromotePrevSession() {
 // and extracts these fields:  mac_address, rssi, channel, frequency, ssid,
 // device_name, gps.latitude, gps.longitude, gps.accuracy.
 //
-// GPS is handled Flask-side via its own USB NMEA puck or browser geolocation;
-// we don't embed GPS here because there's no on-device AP / phone link.
+// GPS now comes from the on-device RYS352A (see gpsLat/gpsLon/gpsFixValid
+// above) instead of a separate USB NMEA puck — `gps` is `null` until the
+// module gets its first fix.
+
+static void gpsJson(char* buf, size_t cap) {
+  if (gpsFixValid) {
+    snprintf(buf, cap, "{\"latitude\":%.7f,\"longitude\":%.7f,\"accuracy\":%.1f}",
+              gpsLat, gpsLon, gpsHdop);
+  } else {
+    snprintf(buf, cap, "null");
+  }
+}
 
 static void emitDetectionJSON(const char* mac, const char* method,
                               int8_t rssi, uint8_t ch, const char* ssid) {
@@ -801,6 +1033,8 @@ static void emitDetectionJSON(const char* mac, const char* method,
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
   const char* band = (ch >= 1 && ch <= 14) ? "2_4ghz" : "5ghz";
+  char gpsBuf[80];
+  gpsJson(gpsBuf, sizeof(gpsBuf));
 
   dualPrintf(
       "{\"event\":\"detection\","
@@ -812,9 +1046,10 @@ static void emitDetectionJSON(const char* mac, const char* method,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
-      "\"ssid\":\"%s\"}\n",
+      "\"ssid\":\"%s\","
+      "\"gps\":%s}\n",
       method, band, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc, gpsBuf);
 }
 
 // ============================================================
@@ -1007,6 +1242,18 @@ static void drainAlertQueue() {
     // rate-limited (still audible via heartbeat, just quieter on the wire).
     fyLastTargetSeen = millis();
 
+#if HUNT_MODE_ENABLED
+    // Hunt mode owns proximity feedback: update the held RSSI for the locked
+    // MAC on EVERY packet (not rate-limited), peak-biased so it snaps up to a
+    // strong burst instantly and only the decay path brings it back down.
+    if (huntMode && memcmp(e.mac, huntMacBytes, 6) == 0) {
+      if (e.rssi > huntDisplayRssi) huntDisplayRssi = e.rssi;
+      else huntDisplayRssi += HUNT_ATTACK * (e.rssi - huntDisplayRssi);
+      huntLastPktMs   = millis();
+      huntLastDecayAt = huntLastPktMs;
+    }
+#endif
+
     // Serial-rate-limit: suppress emit/beep/flash within ALERT_COOLDOWN_MS.
     if (shouldSuppressDuplicate(macStr)) continue;
 
@@ -1032,7 +1279,7 @@ static void drainAlertQueue() {
     //   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
     //   - REPEAT   → silent; the heartbeat tick covers continued presence
     // LED flashes on every emitted detection either way.
-    if (chirpWorthy) {
+    if (chirpWorthy && !huntMode) {
       newDetectChirp();
       // Reset the heartbeat phase so the first follow-up beep lands
       // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
@@ -1062,6 +1309,9 @@ static void autosaveTick() {
 // Heartbeat beep while at least one target was seen in the last
 // HB_DEVICE_ACTIVE_MS. Fires HB_BEEP_INTERVAL_MS apart.
 static void heartbeatTick() {
+#if HUNT_MODE_ENABLED
+  if (huntMode) return;             // hunt audio owns the buzzer while locked
+#endif
   if (fyLastTargetSeen == 0) return;                           // never seen one
   unsigned long now = millis();
   if (now - fyLastTargetSeen > HB_DEVICE_ACTIVE_MS) return;    // gone silent
@@ -1069,6 +1319,110 @@ static void heartbeatTick() {
   heartbeatBeep();
   fyLastHeartbeatAt = now;
 }
+
+// ============================================================
+// HUNT MODE OPS
+// ============================================================
+#if HUNT_MODE_ENABLED
+
+// Linear interpolate an output range across the FAR..NEAR RSSI window.
+static long huntMap(float rssi, long outFar, long outNear) {
+  float r = rssi;
+  if (r < HUNT_RSSI_FAR)  r = HUNT_RSSI_FAR;
+  if (r > HUNT_RSSI_NEAR) r = HUNT_RSSI_NEAR;
+  float t = (r - HUNT_RSSI_FAR) / (float)(HUNT_RSSI_NEAR - HUNT_RSSI_FAR);  // 0..1
+  return outFar + (long)((outNear - outFar) * t + 0.5f);
+}
+
+// Pick the strongest Flock device seen within HUNT_LOCK_RECENT_MS.
+static bool huntAcquireStrongest() {
+  int    best     = -1;
+  int8_t bestRssi = -127;
+  uint32_t now = millis();
+  for (int i = 0; i < fyDetCount; i++) {
+    if ((now - fyDet[i].lastSeen) > HUNT_LOCK_RECENT_MS) continue;
+    if (fyDet[i].rssi > bestRssi) { bestRssi = fyDet[i].rssi; best = i; }
+  }
+  if (best < 0) return false;
+
+  strlcpy(huntMacStr, fyDet[best].mac, sizeof(huntMacStr));
+  sscanf(huntMacStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+         &huntMacBytes[0], &huntMacBytes[1], &huntMacBytes[2],
+         &huntMacBytes[3], &huntMacBytes[4], &huntMacBytes[5]);
+  huntChannel     = fyDet[best].channel ? fyDet[best].channel : currentChannel;
+  huntDisplayRssi = fyDet[best].rssi;
+  huntLastPktMs   = now;
+  huntLastDecayAt = now;
+  huntLastClickAt = 0;
+  return true;
+}
+
+static void huntEnter() {
+  if (!huntAcquireStrongest()) {
+    motorPulse(140, 140);            // weak blip = nothing recent to lock onto
+    dualPrintln("[flockyou] HUNT: no recent target to lock");
+    return;
+  }
+  huntMode = true;
+  esp_wifi_set_channel(huntChannel, WIFI_SECOND_CHAN_NONE);
+  currentChannel = huntChannel;
+  motorSet(140); delay(80); motorSet(255); delay(130); motorSet(0);  // rising "locked"
+  dualPrintf("[flockyou] HUNT: locked %s ch=%u rssi=%.0f\n",
+             huntMacStr, huntChannel, huntDisplayRssi);
+}
+
+static void huntExit(const char* why) {
+  huntMode = false;
+  motorSet(255); delay(80); motorSet(140); delay(130); motorSet(0);  // falling "released"
+  dualPrintf("[flockyou] HUNT: released (%s) → scan\n", why);
+}
+
+// Debounced BOOT-button toggle: press to lock, press again to release.
+static void huntButtonTick() {
+  static int           lastReading = HIGH;
+  static int           stable      = HIGH;
+  static unsigned long lastChange  = 0;
+  int reading = digitalRead(HUNT_BUTTON_PIN);
+  unsigned long now = millis();
+  if (reading != lastReading) { lastReading = reading; lastChange = now; }
+  if ((now - lastChange) > HUNT_BTN_DEBOUNCE_MS && reading != stable) {
+    stable = reading;
+    if (stable == LOW) {            // falling edge = a fresh press
+      if (huntMode) huntExit("button");
+      else          huntEnter();
+    }
+  }
+}
+
+// Geiger-counter audio: faster + higher as the held RSSI rises. Called every
+// loop(). Decays the held RSSI between bursts and auto-releases if the target
+// goes silent past HUNT_REACQUIRE_MS.
+static void huntAudioTick() {
+  if (!huntMode) return;
+  unsigned long now = millis();
+
+  // Sag the held RSSI toward the floor so the pulse strength glides down
+  // between the target's transmit bursts rather than cutting to silence.
+  float dt = (now - huntLastDecayAt) / 1000.0f;
+  huntLastDecayAt = now;
+  if (dt > 0) huntDisplayRssi -= HUNT_DECAY_DB_PER_S * dt;
+  if (huntDisplayRssi < HUNT_RSSI_FAR - 5) huntDisplayRssi = HUNT_RSSI_FAR - 5;
+
+  if ((now - huntLastPktMs) > HUNT_REACQUIRE_MS) {  // lost it — back to scanning
+    huntExit("target lost");
+    return;
+  }
+
+  long interval = huntMap(huntDisplayRssi, HUNT_INT_FAR_MS, HUNT_INT_NEAR_MS);
+  if ((long)(now - huntLastClickAt) >= interval) {
+    long duty = huntMap(huntDisplayRssi, HUNT_DUTY_FAR, HUNT_DUTY_NEAR);
+    motorPulse(HUNT_CLICK_MS, (uint8_t)duty);  // non-blocking (motorTick turns it off)
+    ledFlash(20);
+    huntLastClickAt = now;
+  }
+}
+
+#endif  // HUNT_MODE_ENABLED
 
 // ============================================================
 // SETUP / LOOP
@@ -1085,9 +1439,14 @@ void setup() {
   Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
 #endif
 
-#if USE_BUZZER
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+#if USE_GPS
+  gpsInit();
+#endif
+
+#if USE_MOTOR
+  ledcSetup(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_RES_BITS);
+  ledcAttachPin(MOTOR_PIN, MOTOR_PWM_CHANNEL);
+  ledcWrite(MOTOR_PWM_CHANNEL, 0);
 #endif
 
 #if USE_LED
@@ -1095,9 +1454,8 @@ void setup() {
   ledSet(false);
 #endif
 
-  startupBeep();
-#if USE_LED
-  ledFlash(200);
+#if HUNT_MODE_ENABLED
+  pinMode(HUNT_BUTTON_PIN, INPUT_PULLUP);   // BOOT button = lock/release toggle
 #endif
 
   precompileOuis();
@@ -1120,10 +1478,10 @@ void setup() {
 
   WiFi.mode(WIFI_MODE_NULL);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  esp_wifi_init(&cfg);
+  esp_err_t wifiInitErr  = esp_wifi_init(&cfg);
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   esp_wifi_set_mode(WIFI_MODE_NULL);
-  esp_wifi_start();
+  esp_err_t wifiStartErr = esp_wifi_start();
 
 #if defined(ARDUINO_XIAO_ESP32C5)
   esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
@@ -1142,23 +1500,45 @@ void setup() {
   };
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&wifiSniffer);
-  esp_wifi_set_promiscuous(true);
+  esp_err_t promErr = esp_wifi_set_promiscuous(true);
 
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
                 channelModeName(), CHANNEL_DWELL_MS, currentChannel,
                 RSSI_MIN, fySpiffsReady ? 1 : 0);
 
+  bool wifiOk = (wifiInitErr == ESP_OK) && (wifiStartErr == ESP_OK) && (promErr == ESP_OK);
+  if (fySpiffsReady && wifiOk) {
+    dualPrintln("[flockyou] BOOT OK — ready to scan");
+    startupBeep();
+#if USE_LED
+    ledFlash(200);
+#endif
+  } else {
+    dualPrintln("[flockyou] BOOT FAILED — spiffs/wifi init did not succeed");
+    bootFailBeep();
+  }
+
   lastHeartbeat = millis();
   fyLastSaveAt  = millis();
 }
 
 void loop() {
+#if HUNT_MODE_ENABLED
+  huntButtonTick();    // BOOT button: lock onto / release the strongest target
+#endif
   updateChannelMode();
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
-  heartbeatTick();     // audible beep-pair while a target is still in range
+  heartbeatTick();     // vibration pulse-pair while a target is still in range
+#if HUNT_MODE_ENABLED
+  huntAudioTick();     // Geiger-counter proximity feedback while locked
+#endif
+#if USE_GPS
+  gpsTick();           // drain Serial2, parse any complete NMEA sentence
+#endif
   ledTick();           // turn off LED after LED_FLASH_MS
+  motorTick();         // turn off motor after its pulse duration
   printHeartbeat();
   delay(1);
 }
